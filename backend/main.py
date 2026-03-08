@@ -67,7 +67,7 @@ def process_audio(input_path: str, output_path: str, target_bpm: float, quantize
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/process-audio")
+@app.post("/api/process-audio")
 async def process_audio_endpoint(
     file: UploadFile = File(...),
     targetBpm: float = Form(88.0),
@@ -105,7 +105,7 @@ async def process_audio_endpoint(
         "stretch_factor": metadata["stretch_factor"]
     }
 
-@app.get("/download/{job_id}/{filename}")
+@app.get("/api/download/{job_id}/{filename}")
 async def download_audio(job_id: str, filename: str):
     output_path = os.path.join(TEMP_DIR, f"output_{job_id}.wav")
     if not os.path.exists(output_path):
@@ -119,7 +119,7 @@ async def download_audio(job_id: str, filename: str):
         filename=filename
     )
 
-@app.post("/analyze")
+@app.post("/api/analyze")
 async def analyze_audio(file: UploadFile = File(...)):
     if not file.filename.lower().endswith(('.mp3', '.wav', '.flac', '.ogg', '.m4a')):
         raise HTTPException(status_code=400, detail="Invalid file type.")
