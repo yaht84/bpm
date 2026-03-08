@@ -62,14 +62,17 @@ function App() {
         method: 'POST',
         body: formData,
       });
-      if (response.ok) {
-        const data = await response.json();
-        setDetectedBpm(data.bpm);
-        setCustomBpm(Math.round(data.bpm));
-        setTargetBpm(Math.round(data.bpm));
+      if (!response.ok) {
+        throw new Error(`Server returned ${response.status}: ${response.statusText}`);
       }
+
+      const data = await response.json();
+      setDetectedBpm(data.bpm);
+      setCustomBpm(Math.round(data.bpm));
+      setTargetBpm(Math.round(data.bpm));
     } catch (err) {
       console.error("Analysis failed", err);
+      setError("Analysis failed: " + err.message);
     } finally {
       setIsAnalyzing(false);
     }
