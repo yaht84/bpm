@@ -27,7 +27,9 @@ app.add_middleware(
 TEMP_DIR = tempfile.gettempdir()
 
 def detect_bpm(input_path: str):
-    y, sr = librosa.load(input_path, sr=None)
+    # Optimize memory & CPU for free-tier Docker containers:
+    # Downsample to 22050Hz and only analyze the first 60 seconds.
+    y, sr = librosa.load(input_path, sr=22050, duration=60.0)
     tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
     tempo = np.atleast_1d(tempo)[0]
     if tempo == 0:
