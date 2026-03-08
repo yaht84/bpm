@@ -17,11 +17,20 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Original-Tempo", "X-Stretch-Factor"],
 )
 
 TEMP_DIR = tempfile.gettempdir()
 
-def process_audio(input_path: str, output_path: str, target_bpm: float, quantize: bool):
+def detect_bpm(input_path: str):
+    y, sr = librosa.load(input_path, sr=None)
+    tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+    tempo = np.atleast_1d(tempo)[0]
+    if tempo == 0:
+        raise ValueError("Could not detect tempo of the audio file.")
+    return float(tempo)
+
+def process_audio(input_path: str, output_path: str, target_bpm: float, quantize: bool, input_bpm: float = None):
     """
     If quantize is True, we assume the user wants to quantize a drum loop 
     (detect current tempo and stretch to target tempo).
@@ -32,12 +41,11 @@ def process_audio(input_path: str, output_path: str, target_bpm: float, quantize
     try:
         y, sr = librosa.load(input_path, sr=None)
         
-        # Detect current tempo
-        tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
-        tempo = np.atleast_1d(tempo)[0]
-        
-        if tempo == 0:
-            raise ValueError("Could not detect tempo of the audio file.")
+        # Use target tempo or detect
+        if input_bpm is not None and input_bpm > 0:
+            tempo = input_bpm
+        else:
+            tempo = detect_bpm(input_path)
 
         # If we just want a simple stretch, we still need a reference. 
         # Here we just stretch from detected tempo to target.
@@ -59,7 +67,8 @@ def process_audio(input_path: str, output_path: str, target_bpm: float, quantize
 async def process_audio_endpoint(
     file: UploadFile = File(...),
     targetBpm: float = Form(88.0),
-    quantize: bool = Form(True)
+    quantize: bool = Form(True),
+    inputBpm: float = Form(None)
 ):
     if not file.filename.lower().endswith(('.mp3', '.wav', '.flac', '.ogg', '.m4a')):
         raise HTTPException(status_code=400, detail="Invalid file type. Please upload an audio file.")
@@ -79,21 +88,54 @@ async def process_audio_endpoint(
         raise HTTPException(status_code=500, detail=f"Failed to save file: {str(e)}")
 
     # Process audio
-    metadata = process_audio(input_path, output_path, targetBpm, quantize)
+    metadata = process_audio(input_path, output_path, targetBpm, quantize, inputBpm)
 
-    # Return the processed file
+    # Return JSON with job_id
     if not os.path.exists(output_path):
         raise HTTPException(status_code=500, detail="Processing failed, output file not found.")
 
+    return {
+        "job_id": job_id,
+        "original_tempo": metadata["original_tempo"],
+        "target_tempo": targetBpm,
+        "stretch_factor": metadata["stretch_factor"]
+    }
+
+@app.get("/download/{job_id}/{filename}")
+async def download_audio(job_id: str, filename: str):
+    output_path = os.path.join(TEMP_DIR, f"output_{job_id}.wav")
+    if not os.path.exists(output_path):
+        raise HTTPException(status_code=404, detail="File not found.")
+        
+    # FastAPI's FileResponse automatically sets the Content-Disposition header safely 
+    # when filename is provided, which is fully compatible with Safari across origins.
     return FileResponse(
         path=output_path, 
         media_type="audio/wav", 
-        filename=f"processed_{targetBpm}bpm.wav",
-        headers={
-            "X-Original-Tempo": str(round(metadata["original_tempo"], 2)),
-            "X-Stretch-Factor": str(round(metadata["stretch_factor"], 4))
-        }
+        filename=filename
     )
+
+@app.post("/analyze")
+async def analyze_audio(file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(('.mp3', '.wav', '.flac', '.ogg', '.m4a')):
+        raise HTTPException(status_code=400, detail="Invalid file type.")
+    
+    job_id = str(uuid.uuid4())
+    ext = os.path.splitext(file.filename)[1]
+    input_path = os.path.join(TEMP_DIR, f"analyze_{job_id}{ext}")
+    
+    try:
+        with open(input_path, "wb") as buffer:
+            content = await file.read()
+            buffer.write(content)
+        
+        tempo = detect_bpm(input_path)
+        os.remove(input_path)
+        return {"bpm": tempo}
+    except Exception as e:
+        if os.path.exists(input_path):
+            os.remove(input_path)
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/")
 def read_root():
