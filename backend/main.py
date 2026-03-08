@@ -1,6 +1,7 @@
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 import librosa
 import numpy as np
 import soundfile as sf
@@ -9,6 +10,9 @@ import tempfile
 import uuid
 
 app = FastAPI(title="BPM Modifier API")
+
+# Define path to the built frontend
+FRONTEND_DIST = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
 
 # Enable CORS for the React frontend
 app.add_middleware(
@@ -140,3 +144,21 @@ async def analyze_audio(file: UploadFile = File(...)):
 @app.get("/")
 def read_root():
     return {"message": "BPM Modifier API is running. Use /process-audio to process files."}
+
+# --- Static File Serving for Production (e.g. Render) ---
+# Check if the built frontend directory exists (it will in the Docker container)
+if os.path.isdir(FRONTEND_DIST):
+    # Mount the 'assets' directory explicitly so Vite's /assets/... URLs work 
+    # Must be mounted *before* the catch-all
+    app.mount("/assets", StaticFiles(directory=os.path.join(FRONTEND_DIST, "assets")), name="assets")
+    
+    # Catch-all route to serve the SPA index.html for any unmatched route
+    @app.get("/{full_path:path}")
+    async def serve_frontend(full_path: str):
+        # Serve specific files if requested directly (like favicon)
+        file_path = os.path.join(FRONTEND_DIST, full_path)
+        if os.path.isfile(file_path):
+            return FileResponse(file_path)
+            
+        # Fallback to index.html for client-side routing
+        return FileResponse(os.path.join(FRONTEND_DIST, "index.html"))
