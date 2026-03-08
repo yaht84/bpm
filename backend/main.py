@@ -5,8 +5,9 @@ from fastapi.staticfiles import StaticFiles
 import librosa
 import numpy as np
 import soundfile as sf
-import os
 import tempfile
+import uuid
+import subprocess
 import uuid
 
 app = FastAPI(title="BPM Modifier API")
@@ -26,10 +27,32 @@ app.add_middleware(
 
 TEMP_DIR = tempfile.gettempdir()
 
+def convert_to_wav(input_path: str, output_path: str, duration: float = None, sr: int = None, mono: bool = False):
+    cmd = ["ffmpeg", "-y", "-i", input_path]
+    if duration:
+        cmd.extend(["-t", str(duration)])
+    if sr:
+        cmd.extend(["-ar", str(sr)])
+    if mono:
+        cmd.extend(["-ac", "1"])
+    cmd.append(output_path)
+    # Run ffmpeg to convert to wav (fast and memory efficient)
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+
 def detect_bpm(input_path: str):
     # Optimize memory & CPU for free-tier Docker containers:
-    # Downsample to 22050Hz and only analyze the first 60 seconds.
-    y, sr = librosa.load(input_path, sr=22050, duration=60.0)
+    # Use ffmpeg to extract just the first 45 seconds to a tiny Mono 22050Hz WAV
+    cut_path = input_path + "_detect.wav"
+    try:
+        convert_to_wav(input_path, cut_path, duration=45.0, sr=22050, mono=True)
+        # librosa now loads a tiny raw WAV natively with zero overhead
+        y, sr = librosa.load(cut_path, sr=None)
+    except subprocess.CalledProcessError:
+        raise ValueError("Failed to extract audio with ffmpeg.")
+    finally:
+        if os.path.exists(cut_path):
+            os.remove(cut_path)
+            
     tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
     tempo = np.atleast_1d(tempo)[0]
     if tempo == 0:
@@ -44,8 +67,11 @@ def process_audio(input_path: str, output_path: str, target_bpm: float, quantize
     or we just blindly stretch by a factor.
     For simplicity and based on previous iteration, we detect tempo and stretch.
     """
+    wav_path = input_path + "_full.wav"
     try:
-        y, sr = librosa.load(input_path, sr=None)
+        # Convert whole file to WAV first instantly using ffmpeg to avoid massive librosa/audioread memory leaks
+        convert_to_wav(input_path, wav_path)
+        y, sr = librosa.load(wav_path, sr=None)
         
         # Use target tempo or detect
         if input_bpm is not None and input_bpm > 0:
@@ -67,6 +93,9 @@ def process_audio(input_path: str, output_path: str, target_bpm: float, quantize
         return {"original_tempo": float(tempo), "target_tempo": target_bpm, "stretch_factor": stretch_factor}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if os.path.exists(wav_path):
+            os.remove(wav_path)
 
 
 @app.post("/api/process-audio")
