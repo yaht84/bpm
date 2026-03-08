@@ -5,10 +5,10 @@ from fastapi.staticfiles import StaticFiles
 import librosa
 import numpy as np
 import soundfile as sf
+import os
 import tempfile
 import uuid
 import subprocess
-import uuid
 
 app = FastAPI(title="BPM Modifier API")
 
