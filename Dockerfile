@@ -28,8 +28,9 @@ COPY backend/ /app/backend/
 # Copy built frontend assets
 COPY --from=frontend-builder /app/frontend/dist /app/frontend/dist
 
-# Expose port
-EXPOSE 8000
+# Expose port (Render sets $PORT dynamically, default to 8000)
+ENV PORT=8000
+EXPOSE $PORT
 
-# Run FastAPI with Uvicorn, serving the frontend via static mounts
-CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Run FastAPI with Uvicorn, using Render's $PORT
+CMD uvicorn backend.main:app --host 0.0.0.0 --port $PORT

@@ -3,5 +3,4 @@ services:
     name: bpm-shift
     env: docker
     plan: free
-    dockerCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
-    healthCheckPath: /
+    healthCheckPath: /api/health

@@ -9,16 +9,21 @@ import os
 import tempfile
 import uuid
 import subprocess
+import logging
+
+# Configure logging so we can see errors in Render logs
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="BPM Modifier API")
 
 # Define path to the built frontend
-FRONTEND_DIST = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
+FRONTEND_DIST = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "frontend", "dist")
 
 # Enable CORS for the React frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins for local dev
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -27,7 +32,9 @@ app.add_middleware(
 
 TEMP_DIR = tempfile.gettempdir()
 
+
 def convert_to_wav(input_path: str, output_path: str, duration: float = None, sr: int = None, mono: bool = False):
+    """Use ffmpeg to convert audio to WAV. This is MUCH faster and uses far less memory than librosa.load on MP3s."""
     cmd = ["ffmpeg", "-y", "-i", input_path]
     if duration:
         cmd.extend(["-t", str(duration)])
@@ -36,66 +43,89 @@ def convert_to_wav(input_path: str, output_path: str, duration: float = None, sr
     if mono:
         cmd.extend(["-ac", "1"])
     cmd.append(output_path)
-    # Run ffmpeg to convert to wav (fast and memory efficient)
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if result.returncode != 0:
+        logger.error(f"ffmpeg failed: {result.stderr.decode()}")
+        raise ValueError(f"ffmpeg conversion failed: {result.stderr.decode()[:200]}")
+
 
 def detect_bpm(input_path: str):
-    # Optimize memory & CPU for free-tier Docker containers:
-    # Use ffmpeg to extract just the first 45 seconds to a tiny Mono 22050Hz WAV
+    """Detect BPM using only the first 30 seconds at low sample rate to stay within 512MB RAM."""
     cut_path = input_path + "_detect.wav"
     try:
-        convert_to_wav(input_path, cut_path, duration=45.0, sr=22050, mono=True)
-        # librosa now loads a tiny raw WAV natively with zero overhead
+        # Extract first 30s, mono, 22050Hz — this creates a ~2.5MB file max
+        convert_to_wav(input_path, cut_path, duration=30.0, sr=22050, mono=True)
         y, sr = librosa.load(cut_path, sr=None)
-    except subprocess.CalledProcessError:
-        raise ValueError("Failed to extract audio with ffmpeg.")
+        tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+        tempo = np.atleast_1d(tempo)[0]
+        if tempo == 0:
+            raise ValueError("Could not detect tempo of the audio file.")
+        return float(tempo)
     finally:
         if os.path.exists(cut_path):
             os.remove(cut_path)
-            
-    tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
-    tempo = np.atleast_1d(tempo)[0]
-    if tempo == 0:
-        raise ValueError("Could not detect tempo of the audio file.")
-    return float(tempo)
+
 
 def process_audio(input_path: str, output_path: str, target_bpm: float, quantize: bool, input_bpm: float = None):
     """
-    If quantize is True, we assume the user wants to quantize a drum loop 
-    (detect current tempo and stretch to target tempo).
-    If quantize is False, we just change the tempo assuming the current tempo is irrelevant
-    or we just blindly stretch by a factor.
-    For simplicity and based on previous iteration, we detect tempo and stretch.
+    Detect current BPM (or use provided), then time-stretch to target BPM.
+    Uses ffmpeg pre-conversion + downsampled librosa to stay within memory limits.
     """
+    # Convert to mono 22050Hz WAV to keep memory low even for full-length tracks
     wav_path = input_path + "_full.wav"
     try:
-        # Convert whole file to WAV first instantly using ffmpeg to avoid massive librosa/audioread memory leaks
-        convert_to_wav(input_path, wav_path)
+        convert_to_wav(input_path, wav_path, sr=22050, mono=True)
         y, sr = librosa.load(wav_path, sr=None)
-        
-        # Use target tempo or detect
+
+        # Use provided BPM or detect
         if input_bpm is not None and input_bpm > 0:
             tempo = input_bpm
         else:
             tempo = detect_bpm(input_path)
 
-        # If we just want a simple stretch, we still need a reference. 
-        # Here we just stretch from detected tempo to target.
-        # Librosa rate: rate > 1 speeds up, rate < 1 slows down.
-        # We need rate = target / current
         stretch_factor = target_bpm / tempo
 
         # Apply time stretch
         y_stretched = librosa.effects.time_stretch(y, rate=stretch_factor)
-        
+
         # Save output
         sf.write(output_path, y_stretched, sr)
         return {"original_tempo": float(tempo), "target_tempo": target_bpm, "stretch_factor": stretch_factor}
     except Exception as e:
+        logger.error(f"process_audio failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         if os.path.exists(wav_path):
             os.remove(wav_path)
+
+
+# ==================== API ENDPOINTS ====================
+
+@app.post("/api/analyze")
+async def analyze_audio(file: UploadFile = File(...)):
+    logger.info(f"Analyze request received: {file.filename}")
+    if not file.filename.lower().endswith(('.mp3', '.wav', '.flac', '.ogg', '.m4a')):
+        raise HTTPException(status_code=400, detail="Invalid file type.")
+
+    job_id = str(uuid.uuid4())
+    ext = os.path.splitext(file.filename)[1]
+    input_path = os.path.join(TEMP_DIR, f"analyze_{job_id}{ext}")
+
+    try:
+        with open(input_path, "wb") as buffer:
+            content = await file.read()
+            buffer.write(content)
+        logger.info(f"File saved to {input_path}, size: {len(content)} bytes. Starting BPM detection...")
+
+        tempo = detect_bpm(input_path)
+        logger.info(f"BPM detected: {tempo}")
+        return {"bpm": tempo}
+    except Exception as e:
+        logger.error(f"Analyze failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if os.path.exists(input_path):
+            os.remove(input_path)
 
 
 @app.post("/api/process-audio")
@@ -108,13 +138,11 @@ async def process_audio_endpoint(
     if not file.filename.lower().endswith(('.mp3', '.wav', '.flac', '.ogg', '.m4a')):
         raise HTTPException(status_code=400, detail="Invalid file type. Please upload an audio file.")
 
-    # Unique filenames to avoid clashes
     job_id = str(uuid.uuid4())
     ext = os.path.splitext(file.filename)[1]
     input_path = os.path.join(TEMP_DIR, f"input_{job_id}{ext}")
     output_path = os.path.join(TEMP_DIR, f"output_{job_id}.wav")
 
-    # Save uploaded file
     try:
         with open(input_path, "wb") as buffer:
             content = await file.read()
@@ -122,10 +150,8 @@ async def process_audio_endpoint(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save file: {str(e)}")
 
-    # Process audio
     metadata = process_audio(input_path, output_path, targetBpm, quantize, inputBpm)
 
-    # Return JSON with job_id
     if not os.path.exists(output_path):
         raise HTTPException(status_code=500, detail="Processing failed, output file not found.")
 
@@ -136,65 +162,47 @@ async def process_audio_endpoint(
         "stretch_factor": metadata["stretch_factor"]
     }
 
+
 @app.get("/api/download/{job_id}/{filename}")
 async def download_audio(job_id: str, filename: str):
     output_path = os.path.join(TEMP_DIR, f"output_{job_id}.wav")
     if not os.path.exists(output_path):
         raise HTTPException(status_code=404, detail="File not found.")
-        
-    # FastAPI's FileResponse automatically sets the Content-Disposition header safely 
-    # when filename is provided, which is fully compatible with Safari across origins.
-    return FileResponse(
-        path=output_path, 
-        media_type="audio/wav", 
-        filename=filename
-    )
+    return FileResponse(path=output_path, media_type="audio/wav", filename=filename)
 
-@app.post("/api/analyze")
-async def analyze_audio(file: UploadFile = File(...)):
-    if not file.filename.lower().endswith(('.mp3', '.wav', '.flac', '.ogg', '.m4a')):
-        raise HTTPException(status_code=400, detail="Invalid file type.")
-    
-    job_id = str(uuid.uuid4())
-    ext = os.path.splitext(file.filename)[1]
-    input_path = os.path.join(TEMP_DIR, f"analyze_{job_id}{ext}")
-    
-    try:
-        with open(input_path, "wb") as buffer:
-            content = await file.read()
-            buffer.write(content)
-        
-        tempo = detect_bpm(input_path)
-        os.remove(input_path)
-        return {"bpm": tempo}
-    except Exception as e:
-        if os.path.exists(input_path):
-            os.remove(input_path)
-        raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/")
-def read_root():
-    return {"message": "BPM Modifier API is running. Use /process-audio to process files."}
+# ==================== HEALTH CHECK ====================
 
-# --- Static File Serving for Production (e.g. Render) ---
-# Check if the built frontend directory exists (it will in the Docker container)
+@app.get("/api/health")
+async def health_check():
+    return {"status": "ok"}
+
+
+# ==================== STATIC FILE SERVING (Production only) ====================
+# In Docker, the built Vite frontend is at /app/frontend/dist
+# This block MUST come LAST so API routes take priority
+
 if os.path.isdir(FRONTEND_DIST):
-    # Mount the 'assets' directory explicitly so Vite's /assets/... URLs work 
-    # Must be mounted *before* the catch-all
-    app.mount("/assets", StaticFiles(directory=os.path.join(FRONTEND_DIST, "assets")), name="assets")
-    
-    # Explicitly serve index.html at exactly the root URL
+    logger.info(f"Frontend dist found at {FRONTEND_DIST}, mounting static files")
+
+    # Mount assets subdirectory for Vite's hashed JS/CSS bundles
+    assets_dir = os.path.join(FRONTEND_DIST, "assets")
+    if os.path.isdir(assets_dir):
+        app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+
     @app.get("/")
     async def serve_root():
         return FileResponse(os.path.join(FRONTEND_DIST, "index.html"))
-        
-    # Catch-all route to serve the SPA index.html for any unmatched route
+
     @app.get("/{full_path:path}")
     async def serve_frontend(full_path: str):
-        # Serve specific files if requested directly (like favicon, logo)
         file_path = os.path.join(FRONTEND_DIST, full_path)
         if os.path.isfile(file_path):
             return FileResponse(file_path)
-            
-        # Fallback to index.html for client-side routing
         return FileResponse(os.path.join(FRONTEND_DIST, "index.html"))
+else:
+    logger.info(f"No frontend dist at {FRONTEND_DIST}, running in API-only mode")
+
+    @app.get("/")
+    async def api_root():
+        return {"message": "BPM Modifier API is running."}
