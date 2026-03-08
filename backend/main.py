@@ -10,6 +10,7 @@ import tempfile
 import uuid
 import subprocess
 import logging
+import shutil
 
 # Configure logging so we can see errors in Render logs
 logging.basicConfig(level=logging.INFO)
@@ -102,7 +103,7 @@ def process_audio(input_path: str, output_path: str, target_bpm: float, quantize
 # ==================== API ENDPOINTS ====================
 
 @app.post("/api/analyze")
-async def analyze_audio(file: UploadFile = File(...)):
+def analyze_audio(file: UploadFile = File(...)):
     logger.info(f"Analyze request received: {file.filename}")
     if not file.filename.lower().endswith(('.mp3', '.wav', '.flac', '.ogg', '.m4a')):
         raise HTTPException(status_code=400, detail="Invalid file type.")
@@ -113,9 +114,8 @@ async def analyze_audio(file: UploadFile = File(...)):
 
     try:
         with open(input_path, "wb") as buffer:
-            content = await file.read()
-            buffer.write(content)
-        logger.info(f"File saved to {input_path}, size: {len(content)} bytes. Starting BPM detection...")
+            shutil.copyfileobj(file.file, buffer)
+        logger.info(f"File saved to {input_path}. Starting BPM detection...")
 
         tempo = detect_bpm(input_path)
         logger.info(f"BPM detected: {tempo}")
@@ -129,7 +129,7 @@ async def analyze_audio(file: UploadFile = File(...)):
 
 
 @app.post("/api/process-audio")
-async def process_audio_endpoint(
+def process_audio_endpoint(
     file: UploadFile = File(...),
     targetBpm: float = Form(88.0),
     quantize: bool = Form(True),
@@ -145,8 +145,7 @@ async def process_audio_endpoint(
 
     try:
         with open(input_path, "wb") as buffer:
-            content = await file.read()
-            buffer.write(content)
+            shutil.copyfileobj(file.file, buffer)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save file: {str(e)}")
 
@@ -164,7 +163,7 @@ async def process_audio_endpoint(
 
 
 @app.get("/api/download/{job_id}/{filename}")
-async def download_audio(job_id: str, filename: str):
+def download_audio(job_id: str, filename: str):
     output_path = os.path.join(TEMP_DIR, f"output_{job_id}.wav")
     if not os.path.exists(output_path):
         raise HTTPException(status_code=404, detail="File not found.")
