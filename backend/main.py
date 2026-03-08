@@ -152,10 +152,15 @@ if os.path.isdir(FRONTEND_DIST):
     # Must be mounted *before* the catch-all
     app.mount("/assets", StaticFiles(directory=os.path.join(FRONTEND_DIST, "assets")), name="assets")
     
+    # Explicitly serve index.html at exactly the root URL
+    @app.get("/")
+    async def serve_root():
+        return FileResponse(os.path.join(FRONTEND_DIST, "index.html"))
+        
     # Catch-all route to serve the SPA index.html for any unmatched route
     @app.get("/{full_path:path}")
     async def serve_frontend(full_path: str):
-        # Serve specific files if requested directly (like favicon)
+        # Serve specific files if requested directly (like favicon, logo)
         file_path = os.path.join(FRONTEND_DIST, full_path)
         if os.path.isfile(file_path):
             return FileResponse(file_path)
