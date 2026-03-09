@@ -2,15 +2,14 @@ from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-import aubio
 import numpy as np
+import wave
 import os
 import tempfile
 import uuid
 import subprocess
 import logging
 import shutil
-import wave
 
 # Configure logging so we can see errors in Render logs
 logging.basicConfig(level=logging.INFO)
@@ -51,28 +50,42 @@ def convert_to_wav(input_path: str, output_path: str, duration: float = None, sr
 
 
 def detect_bpm(input_path: str) -> float:
-    """Detect BPM using aubio (lightweight, no librosa). Analyzes first 30s at 44100Hz mono."""
+    """
+    Detect BPM using energy-envelope autocorrelation — pure numpy + stdlib wave module.
+    No compilation or extra system libs needed beyond ffmpeg.
+    Analyzes first 30s at 22050Hz mono.
+    """
     cut_path = input_path + "_detect.wav"
     try:
-        convert_to_wav(input_path, cut_path, duration=30.0, sr=44100, mono=True)
+        convert_to_wav(input_path, cut_path, duration=30.0, sr=22050, mono=True)
 
-        samplerate = 44100
-        win_s = 1024
-        hop_s = 512
+        with wave.open(cut_path, "rb") as wf:
+            sr = wf.getframerate()
+            raw = wf.readframes(wf.getnframes())
 
-        source = aubio.source(cut_path, samplerate, hop_s)
-        tempo_detector = aubio.tempo("default", win_s, hop_s, samplerate)
+        y = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
 
-        while True:
-            samples, read = source()
-            tempo_detector(samples)
-            if read < hop_s:
-                break
+        # Energy envelope with hop of 512 samples
+        hop = 512
+        n_hops = len(y) // hop
+        energy = np.array([np.sum(y[i * hop:(i + 1) * hop] ** 2) for i in range(n_hops)])
 
-        bpm = float(tempo_detector.get_bpm())
+        # Onset strength: positive energy rises
+        onset = np.maximum(np.diff(energy), 0)
+
+        # Autocorrelation to find periodicity
+        corr = np.correlate(onset, onset, mode="full")
+        corr = corr[len(corr) // 2:]
+
+        # Search BPM range 60–200 bpm
+        min_period = max(1, int(sr / hop * 60 / 200))
+        max_period = int(sr / hop * 60 / 60)
+        peak = np.argmax(corr[min_period:max_period]) + min_period
+
+        bpm = 60.0 * sr / hop / peak
         if bpm <= 0:
             raise ValueError("Could not detect tempo of the audio file.")
-        return bpm
+        return float(bpm)
     finally:
         if os.path.exists(cut_path):
             os.remove(cut_path)
