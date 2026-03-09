@@ -1,8 +1,5 @@
 fastapi
 python-multipart
 uvicorn
-librosa
-soundfile
+aubio
 numpy
-scipy
-pydub

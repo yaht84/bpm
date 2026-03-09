@@ -2,15 +2,15 @@ from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-import librosa
+import aubio
 import numpy as np
-import soundfile as sf
 import os
 import tempfile
 import uuid
 import subprocess
 import logging
 import shutil
+import wave
 
 # Configure logging so we can see errors in Render logs
 logging.basicConfig(level=logging.INFO)
@@ -35,7 +35,7 @@ TEMP_DIR = tempfile.gettempdir()
 
 
 def convert_to_wav(input_path: str, output_path: str, duration: float = None, sr: int = None, mono: bool = False):
-    """Use ffmpeg to convert audio to WAV. This is MUCH faster and uses far less memory than librosa.load on MP3s."""
+    """Use ffmpeg to convert audio to WAV."""
     cmd = ["ffmpeg", "-y", "-i", input_path]
     if duration:
         cmd.extend(["-t", str(duration)])
@@ -50,54 +50,72 @@ def convert_to_wav(input_path: str, output_path: str, duration: float = None, sr
         raise ValueError(f"ffmpeg conversion failed: {result.stderr.decode()[:200]}")
 
 
-def detect_bpm(input_path: str):
-    """Detect BPM using only the first 30 seconds at low sample rate to stay within 512MB RAM."""
+def detect_bpm(input_path: str) -> float:
+    """Detect BPM using aubio (lightweight, no librosa). Analyzes first 30s at 44100Hz mono."""
     cut_path = input_path + "_detect.wav"
     try:
-        # Extract first 30s, mono, 22050Hz — this creates a ~2.5MB file max
-        convert_to_wav(input_path, cut_path, duration=30.0, sr=22050, mono=True)
-        y, sr = librosa.load(cut_path, sr=None)
-        tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
-        tempo = np.atleast_1d(tempo)[0]
-        if tempo == 0:
+        convert_to_wav(input_path, cut_path, duration=30.0, sr=44100, mono=True)
+
+        samplerate = 44100
+        win_s = 1024
+        hop_s = 512
+
+        source = aubio.source(cut_path, samplerate, hop_s)
+        tempo_detector = aubio.tempo("default", win_s, hop_s, samplerate)
+
+        while True:
+            samples, read = source()
+            tempo_detector(samples)
+            if read < hop_s:
+                break
+
+        bpm = float(tempo_detector.get_bpm())
+        if bpm <= 0:
             raise ValueError("Could not detect tempo of the audio file.")
-        return float(tempo)
+        return bpm
     finally:
         if os.path.exists(cut_path):
             os.remove(cut_path)
 
 
-def process_audio(input_path: str, output_path: str, target_bpm: float, quantize: bool, input_bpm: float = None):
+def build_atempo_filter(rate: float) -> str:
     """
-    Detect current BPM (or use provided), then time-stretch to target BPM.
-    Uses ffmpeg pre-conversion + downsampled librosa to stay within memory limits.
+    Build an ffmpeg atempo filter chain.
+    atempo only accepts values in [0.5, 2.0], so chain multiple filters for extremes.
     """
-    # Convert to mono 22050Hz WAV to keep memory low even for full-length tracks
-    wav_path = input_path + "_full.wav"
-    try:
-        convert_to_wav(input_path, wav_path, sr=22050, mono=True)
-        y, sr = librosa.load(wav_path, sr=None)
+    filters = []
+    r = rate
+    while r > 2.0:
+        filters.append("atempo=2.0")
+        r /= 2.0
+    while r < 0.5:
+        filters.append("atempo=0.5")
+        r *= 2.0
+    filters.append(f"atempo={r:.6f}")
+    return ",".join(filters)
 
-        # Use provided BPM or detect
-        if input_bpm is not None and input_bpm > 0:
-            tempo = input_bpm
-        else:
-            tempo = detect_bpm(input_path)
 
-        stretch_factor = target_bpm / tempo
+def process_audio(input_path: str, output_path: str, target_bpm: float, input_bpm: float = None):
+    """
+    Time-stretch audio to target BPM using ffmpeg atempo filter.
+    No audio is loaded into Python RAM — ffmpeg handles everything as a stream.
+    """
+    if input_bpm is not None and input_bpm > 0:
+        tempo = input_bpm
+    else:
+        tempo = detect_bpm(input_path)
 
-        # Apply time stretch
-        y_stretched = librosa.effects.time_stretch(y, rate=stretch_factor)
+    stretch_factor = target_bpm / tempo
+    atempo_filter = build_atempo_filter(stretch_factor)
 
-        # Save output
-        sf.write(output_path, y_stretched, sr)
-        return {"original_tempo": float(tempo), "target_tempo": target_bpm, "stretch_factor": stretch_factor}
-    except Exception as e:
-        logger.error(f"process_audio failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        if os.path.exists(wav_path):
-            os.remove(wav_path)
+    cmd = ["ffmpeg", "-y", "-i", input_path, "-af", atempo_filter, output_path]
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if result.returncode != 0:
+        err = result.stderr.decode()
+        logger.error(f"ffmpeg atempo failed: {err}")
+        raise ValueError(f"ffmpeg time-stretch failed: {err[:200]}")
+
+    return {"original_tempo": float(tempo), "target_tempo": target_bpm, "stretch_factor": stretch_factor}
 
 
 # ==================== API ENDPOINTS ====================
@@ -149,7 +167,14 @@ def process_audio_endpoint(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save file: {str(e)}")
 
-    metadata = process_audio(input_path, output_path, targetBpm, quantize, inputBpm)
+    try:
+        metadata = process_audio(input_path, output_path, targetBpm, inputBpm)
+    except Exception as e:
+        logger.error(f"process_audio failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if os.path.exists(input_path):
+            os.remove(input_path)
 
     if not os.path.exists(output_path):
         raise HTTPException(status_code=500, detail="Processing failed, output file not found.")
@@ -184,7 +209,6 @@ async def health_check():
 if os.path.isdir(FRONTEND_DIST):
     logger.info(f"Frontend dist found at {FRONTEND_DIST}, mounting static files")
 
-    # Mount assets subdirectory for Vite's hashed JS/CSS bundles
     assets_dir = os.path.join(FRONTEND_DIST, "assets")
     if os.path.isdir(assets_dir):
         app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")

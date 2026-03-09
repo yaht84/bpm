@@ -12,10 +12,10 @@ RUN npm run build
 FROM python:3.11-slim
 WORKDIR /app
 
-# Install system dependencies required for librosa and soundfile
+# Install system dependencies: ffmpeg for audio processing, libaubio-dev for aubio Python bindings
 RUN apt-get update && apt-get install -y \
-    libsndfile1 \
     ffmpeg \
+    libaubio-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
